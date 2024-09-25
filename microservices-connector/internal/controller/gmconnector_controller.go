@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"text/template"
@@ -20,6 +21,7 @@ import (
 	mcv1alpha3 "github.com/opea-project/GenAIInfra/microservices-connector/api/v1alpha3"
 	"github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -71,6 +73,7 @@ const (
 	SpeechT5Gaudi            = "SpeechT5Gaudi"
 	Whisper                  = "Whisper"
 	WhisperGaudi             = "WhisperGaudi"
+	HPA                      = "HorizontalPodAutoscaler"
 )
 
 var yamlDict = map[string]string{
@@ -96,6 +99,8 @@ var yamlDict = map[string]string{
 	WhisperGaudi:      yaml_dir + "whisper_gaudi.yaml",
 	DataPrep:          yaml_dir + "data-prep.yaml",
 }
+
+var stepSupportHPA = []string{TeiEmbedding, TeiReranking, Tgi}
 
 var (
 	_log = ctrl.Log.WithName("GMC")
@@ -141,9 +146,17 @@ func (r *GMConnectorReconciler) reconcileResource(ctx context.Context, graphNs s
 		ns = stepCfg.InternalService.NameSpace
 	}
 	svc := stepCfg.InternalService.ServiceName
-	svcCfg := &stepCfg.InternalService.Config
+	svcCfg := stepCfg.InternalService.Config
 
-	yamlFile, err := getTemplateBytes(stepCfg.StepName)
+	suffix := ""
+	if slices.Contains(stepSupportHPA, stepCfg.StepName) {
+		if value, ok := svcCfg["enableHPA"]; ok && value == "true" {
+			suffix = "hpa"
+			_log.Info("Enable HPA for", "service", svc) 
+		}
+	}
+
+	yamlFile, err := getTemplateBytes(stepCfg.StepName, suffix)
 	if err != nil {
 		_log.Error(err, "Failed to get template bytes for", "step", stepCfg.StepName)
 		return nil, err
@@ -183,6 +196,22 @@ func (r *GMConnectorReconciler) reconcileResource(ctx context.Context, graphNs s
 				_log.Error(err, "Failed to convert service to object", "name", svc)
 				return nil, err
 			}
+		} else if obj.GetKind() == HPA {
+			hpa_obj := &autoscalingv2.HorizontalPodAutoscaler{}
+			err = scheme.Scheme.Convert(obj, hpa_obj, nil)
+			if err != nil {
+				_log.Error(err, "Failed to convert unstructured to HorizontalPodAutoscaler", "name", svc)
+				return nil, err
+			}
+			hpa_obj.SetName(svc)
+			hpa_obj.Spec.ScaleTargetRef.Name = svc + dplymtSubfix
+			hpa_obj.Spec.Metrics[0].Object.DescribedObject.Name = svc
+
+			err = scheme.Scheme.Convert(hpa_obj, obj, nil)
+			if err != nil {
+				_log.Error(err, "Failed to convert HorizontalPodAutoscaler to object", "name", svc)
+				return nil, err
+			}
 		} else if obj.GetKind() == Deployment {
 			deployment_obj := &appsv1.Deployment{}
 			err = scheme.Scheme.Convert(obj, deployment_obj, nil)
@@ -199,8 +228,8 @@ func (r *GMConnectorReconciler) reconcileResource(ctx context.Context, graphNs s
 
 			// append the user defined ENVs
 			var newEnvVars []corev1.EnvVar
-			for name, value := range *svcCfg {
-				if name == "endpoint" || name == "nodes" {
+			for name, value := range svcCfg {
+				if name == "endpoint" || name == "nodes" || name == "enableHPA" {
 					continue
 				}
 				if isDownStreamEndpointKey(name) {
@@ -567,10 +596,13 @@ func recordResource(graph *mcv1alpha3.GMConnector, nodeName string, stepIdx int,
 	return nil
 }
 
-func getTemplateBytes(resourceType string) ([]byte, error) {
+func getTemplateBytes(resourceType string, suffix string) ([]byte, error) {
 	tmpltFile := lookupManifestDir(resourceType)
 	if tmpltFile == "" {
 		return nil, errors.New("unexpected target")
+	}
+	if len(suffix) > 0 {
+		tmpltFile = strings.Replace(tmpltFile, ".yaml", fmt.Sprintf("_%s.yaml", suffix), 1)
 	}
 	yamlBytes, err := os.ReadFile(tmpltFile)
 	if err != nil {
@@ -614,7 +646,7 @@ func (r *GMConnectorReconciler) reconcileRouterService(ctx context.Context, grap
 	configForRouter["svcName"] = routerServiceName
 	configForRouter["dplymntName"] = routerDeploymentName
 
-	templateBytes, err := getTemplateBytes(Router)
+	templateBytes, err := getTemplateBytes(Router, "")
 	if err != nil {
 		return errors.Wrapf(err, "Failed to get template bytes for %s", Router)
 	}
